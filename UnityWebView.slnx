@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="UnityWebView.vcxproj" Id="102f5978-7941-4654-ab8f-17e7b648ce31" />
+</Solution>
