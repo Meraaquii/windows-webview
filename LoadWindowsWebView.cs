@@ -231,3 +231,34 @@ public class LoadWindowsWebView : MonoBehaviour
     }
 #endif
 }
+
+// ---- Data models for JSON payloads from WebView ----
+
+[System.Serializable]
+public class _FlatDetails
+{
+    public int apartment_id;
+    public int tower_id;
+    public string flatNo;
+    public string subArea;
+    public string bua;
+    public string carpetArea;
+    public int balcony;
+    public string zoomUrl;
+    public string isometricUrl;
+    public Interior[] interiors;
+}
+
+[System.Serializable]
+public class Interior
+{
+    public string area_name;
+    public string dimension;
+}
+
+[System.Serializable]
+public class SelectedInterior
+{
+    public string area_name;
+    public string dimension;
+}
