@@ -41,10 +41,10 @@ public class LoadWindowsWebView : MonoBehaviour
     private static extern void ClearCookies();
 
     [DllImport("UnityWebView", CallingConvention = CallingConvention.Cdecl)]
-    private static extern double GetCurrentFPS();
+    private static extern void ShowFPSDebugOverlay([MarshalAs(UnmanagedType.U1)] bool show);
 
     [DllImport("UnityWebView", CallingConvention = CallingConvention.Cdecl)]
-    private static extern void ShowFPSDebugOverlay([MarshalAs(UnmanagedType.U1)] bool show);
+    private static extern double GetCurrentFPS();
 
     [DllImport("UnityWebView", CallingConvention = CallingConvention.Cdecl)]
     private static extern void SetRenderResolutionScale(float scale);
@@ -52,9 +52,16 @@ public class LoadWindowsWebView : MonoBehaviour
     [DllImport("UnityWebView", CallingConvention = CallingConvention.Cdecl)]
     private static extern void SetMaxRenderResolution(int maxWidth);
 
-    [Header("WebView Settings")]
-    public string url = "https://www.google.com";
-    public string dataPath = "";
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetActiveWindow();
+
+    public string uri = "https://www.google.com";
+    private string loaderUri = "https://interactive.meraaquii.com/webgl/meraaquiiLoader/";
+    private bool _isReady = false;
+    private bool _isVisible = false;
+    private bool _fpsOverlayShown = false;
+    private float _fpsLogTimer = 0f;
+    private const float FPS_LOG_INTERVAL = 2f;
 
     [Header("Render Resolution Cap (for 4K screens)")]
     [Tooltip("0 = unlimited native resolution. 1920 = 2K cap. 2560 = QHD cap.")]
@@ -63,176 +70,292 @@ public class LoadWindowsWebView : MonoBehaviour
     [Tooltip("Overrides maxRenderWidth if > 0. 0.5 = half internal resolution.")]
     public float manualRenderScale = 0f;
 
-    private bool _initialized = false;
-
     void Start()
     {
-        StartCoroutine(Initialize());
-    }
-
-    private System.Collections.IEnumerator Initialize()
-    {
-#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
-        IntPtr hwnd = GetUnityWindowHandle();
-        if (hwnd == IntPtr.Zero)
+#if UNITY_STANDALONE_WIN
+        try
         {
-            Debug.LogError("[LoadWindowsWebView] Could not find Unity window handle.");
-            yield break;
+            IntPtr hwnd = GetActiveWindow();
+            string dataPath = System.IO.Path.Combine(Application.persistentDataPath, "WebViewCache");
+            if (!System.IO.Directory.Exists(dataPath)) 
+                System.IO.Directory.CreateDirectory(dataPath);
+
+            Debug.Log("<color=cyan>WebView: Initializing...</color>");
+            InitWebView(hwnd, dataPath);
         }
-
-        string path = string.IsNullOrEmpty(dataPath)
-            ? System.IO.Path.Combine(Application.persistentDataPath, "WebViewData")
-            : dataPath;
-        System.IO.Directory.CreateDirectory(path);
-
-        InitWebView(hwnd, path);
-
-        while (GetInitStatus() == 0)
-            yield return null;
-
-        int status = GetInitStatus();
-        if (status == 1)
+        catch (Exception e)
         {
-            _initialized = true;
-            Debug.Log("[LoadWindowsWebView] Ready.");
-
-            if (manualRenderScale > 0f)
-                SetRenderResolutionScale(manualRenderScale);
-            else if (maxRenderWidth > 0)
-                SetMaxRenderResolution(maxRenderWidth);
-
-            ShowAndNavigate(url);
+            Debug.LogError($"<color=red>Failed to initialize WebView: {e.Message}</color>");
         }
-        else
-        {
-            Debug.LogError($"[LoadWindowsWebView] Init failed: {status}");
-        }
-#else
-        Debug.LogWarning("[LoadWindowsWebView] Windows standalone builds only.");
-        yield break;
 #endif
     }
 
-    void OnApplicationQuit()
+    void Update()
     {
-        CloseWebView();
+#if !UNITY_STANDALONE_WIN
+        return;
+#endif
+
+        if (!_isReady)
+        {
+            int status = GetInitStatus();
+            if (status == 1)
+            {
+                _isReady = true;
+                Debug.Log("<color=cyan>WebView status: Ready to use.</color>");
+
+                if (manualRenderScale > 0f)
+                    SetRenderResolutionScale(manualRenderScale);
+                else if (maxRenderWidth > 0)
+                    SetMaxRenderResolution(maxRenderWidth);
+            }
+            else if (status < 0)
+            {
+                Debug.LogError($"<color=red>WebView Init Failed! Code: {status}</color>");
+                _isReady = true;
+            }
+        }
+
+        // Update WebView size when visible
+        if (_isVisible && _isReady && Time.frameCount % 30 == 0)
+        {
+            UpdateWebViewSize();
+        }
+
+        // Log FPS periodically (not every frame to avoid console spam)
+        if (_isReady)
+        {
+            _fpsLogTimer += Time.deltaTime;
+            if (_fpsLogTimer >= FPS_LOG_INTERVAL)
+            {
+                double fps = GetCurrentFPS();
+                if (fps > 0)
+                    Debug.Log($"<color=cyan>WebView FPS: {fps:F1}</color>");
+                _fpsLogTimer = 0f;
+            }
+        }
     }
 
-    void OnDestroy()
+    public void OnViewOpenCalled(string url)
     {
-        CloseWebView();
+#if !UNITY_STANDALONE_WIN
+        Debug.LogWarning("WebView is only supported on Windows standalone builds.");
+        return;
+#endif
+
+        if (!_isReady)
+        {
+            Debug.LogWarning("WebView not ready yet. Please wait...");
+            return;
+        }
+
+        uri = url;
+        Debug.Log($"<color=cyan>Opening WebView with URL:</color> {uri}");
+
+        try
+        {
+            ShowAndNavigate(uri);
+            UpdateWebViewSize();
+            _isVisible = true;
+
+            // Enable FPS overlay AFTER page loads (delay 1 second)
+            if (!_fpsOverlayShown)
+            {
+                Invoke(nameof(EnableFPSOverlay), 1f);
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"<color=red>Failed to open WebView: {e.Message}</color>");
+        }
     }
 
-    // ---- Public helpers ----
-
-    public void Navigate(string targetUrl)
+    private void EnableFPSOverlay()
     {
-        if (!_initialized) return;
-        NavigateTo(targetUrl);
+        if (_fpsOverlayShown) return;
+
+        try
+        {
+            ShowFPSDebugOverlay(true);
+            _fpsOverlayShown = true;
+            Debug.Log("<color=green>FPS Debug Overlay Enabled</color>");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"<color=red>Failed to enable FPS overlay: {e.Message}</color>");
+        }
     }
 
-    public void Show(string targetUrl)
+    private void DisableFPSOverlay()
     {
-        if (!_initialized) return;
-        ShowAndNavigate(targetUrl);
+        if (!_fpsOverlayShown) return;
+
+        try
+        {
+            ShowFPSDebugOverlay(false);
+            _fpsOverlayShown = false;
+            Debug.Log("<color=yellow>FPS Debug Overlay Disabled</color>");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"<color=red>Failed to disable FPS overlay: {e.Message}</color>");
+        }
     }
 
-    public void Hide()
+    public void OnWebMessageReceived(string message)
     {
-        if (!_initialized) return;
-        HideWebView();
+        Debug.Log($"<color=yellow>Raw message from WebView:</color> {message}");
+
+        if (message == "close_button_pressed")
+        {
+            Debug.Log("Native close button pressed");
+            OnCloseButtonClicked();
+            return;
+        }
+
+        try
+        {
+            WebMessage webMsg = JsonUtility.FromJson<WebMessage>(message);
+            Debug.Log($"<color=cyan>Parsed action:</color> {webMsg.action}");
+
+            switch (webMsg.action)
+            {
+                case "close":
+                    Debug.Log("React requested close");
+                    OnCloseButtonClicked();
+                    break;
+
+                case "apartmentSelected":
+                    Debug.Log("<color=green>Apartment data received!</color>");
+                    HandleApartmentSelection(webMsg);
+                    break;
+
+                case "sendMessage":
+                    Debug.Log($"React sent message: {webMsg.value}");
+                    DisplayMessage(webMsg.value);
+                    break;
+
+                case "sendData":
+                    Debug.Log($"React sent data - Name: {webMsg.name}, Value: {webMsg.value}");
+                    HandleDataFromReact(webMsg.name, webMsg.value);
+                    break;
+
+                default:
+                    Debug.LogWarning($"Unknown action: {webMsg.action}");
+                    break;
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"<color=red>Error parsing web message: {e.Message}\nMessage: {message}</color>");
+        }
     }
 
-    public void Resize(int x, int y, int width, int height)
+    private void HandleApartmentSelection(WebMessage msg)
     {
-        if (!_initialized) return;
-        ResizeWebView(x, y, width, height);
+        Debug.Log("=== Apartment Selection Details ===");
+        Debug.Log($"Tower: {msg.tower}");
+        Debug.Log($"Floor: {msg.floor}");
+        Debug.Log($"Apartment: {msg.apt}");
+        Debug.Log($"Apartment Name: {msg.aptName}");
+        Debug.Log($"Variant: {msg.variant}");
+
+        if (msg.flatDetails != null)
+        {
+            Debug.Log($"Flat No: {msg.flatDetails.flatNo}");
+            Debug.Log($"BUA: {msg.flatDetails.bua}");
+            Debug.Log($"Carpet Area: {msg.flatDetails.carpetArea}");
+            Debug.Log($"Balcony: {msg.flatDetails.balcony}");
+        }
+
+        if (msg.selectedInterior != null)
+        {
+            Debug.Log($"Selected Interior: {msg.selectedInterior.area_name}");
+            Debug.Log($"Dimension: {msg.selectedInterior.dimension}");
+        }
+
+        Debug.Log("===================================");
     }
 
-    public void RunScript(string script)
+    private void DisplayMessage(string message)
     {
-        if (!_initialized) return;
-        ExecuteScript(script);
+        Debug.Log($"<color=green>Displaying message:</color> {message}");
     }
 
-    public void PostMessage(string message)
+    private void HandleDataFromReact(string name, string value)
     {
-        if (!_initialized) return;
-        PostWebMessage(message);
+        Debug.Log($"<color=cyan>Processing data:</color> {name} = {value}");
     }
 
-    public void SetCookieRaw(string name, string value, string domain,
-        string path = "/", bool secure = false, bool httpOnly = false, long expiresEpoch = 0)
+    public void OnCloseButtonClicked()
     {
-        if (!_initialized) return;
-        string data = $"{name}\n{value}\n{domain}\n{path}\n{(secure ? 1 : 0)}\n{(httpOnly ? 1 : 0)}\n{expiresEpoch}";
-        SetCookie(data);
+        Debug.Log("<color=yellow>Closing WebView...</color>");
+        DisableFPSOverlay();
+        _isVisible = false;
+
+#if UNITY_STANDALONE_WIN
+        try
+        {
+            HideWebView();
+            NavigateTo(loaderUri);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"<color=red>Error closing WebView: {e.Message}</color>");
+        }
+#endif
     }
 
-    public void DeleteAllCookies()
+    private void UpdateWebViewSize()
     {
-        if (!_initialized) return;
-        ClearCookies();
+        ResizeWebView(20, 100, Screen.width - 40, Screen.height - 150);
     }
 
-    public double FPS => _initialized ? GetCurrentFPS() : 0.0;
-
-    public void ShowDebugFPS(bool show)
+    private void OnApplicationQuit()
     {
-        if (!_initialized) return;
-        ShowFPSDebugOverlay(show);
+        Debug.Log("Application quitting, closing WebView...");
+        try
+        {
+            CloseWebView();
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Error during WebView cleanup: {e.Message}");
+        }
     }
+
+    // ---- Resolution helpers ----
 
     public void SetScale(float scale)
     {
-        if (!_initialized) return;
+        if (!_isReady) return;
         SetRenderResolutionScale(scale);
     }
 
     public void SetMaxRes(int maxWidth)
     {
-        if (!_initialized) return;
+        if (!_isReady) return;
         SetMaxRenderResolution(maxWidth);
     }
-
-    // ---- Window handle helper ----
-
-#if UNITY_STANDALONE_WIN && !UNITY_EDITOR
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-
-    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
-
-    private static IntPtr GetUnityWindowHandle()
-    {
-        var proc = System.Diagnostics.Process.GetCurrentProcess();
-        if (proc.MainWindowHandle != IntPtr.Zero)
-            return proc.MainWindowHandle;
-
-        string title = Application.productName;
-        if (string.IsNullOrEmpty(title)) title = proc.ProcessName;
-
-        var sb = new System.Text.StringBuilder(256);
-        foreach (var p in System.Diagnostics.Process.GetProcesses())
-        {
-            try
-            {
-                if (p.Id == proc.Id && p.MainWindowHandle != IntPtr.Zero)
-                {
-                    GetWindowText(p.MainWindowHandle, sb, 256);
-                    if (sb.ToString().IndexOf(title, StringComparison.OrdinalIgnoreCase) >= 0)
-                        return p.MainWindowHandle;
-                }
-            }
-            catch { }
-        }
-        return IntPtr.Zero;
-    }
-#endif
 }
 
-// ---- Data models for JSON payloads from WebView ----
+// Data structures for parsing JSON messages from React
+[System.Serializable]
+public class WebMessage
+{
+    public string action;
+    public string value;
+    public string name;
+    public string data;
+
+    public string tower;
+    public string floor;
+    public string apt;
+    public string aptName;
+    public string variant;
+    public _FlatDetails flatDetails;
+    public SelectedInterior selectedInterior;
+}
 
 [System.Serializable]
 public class _FlatDetails
