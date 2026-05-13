@@ -30,18 +30,30 @@ static DWORD g_controllerThreadId = 0;
 static bool g_comInitializedOnCreatorThread = false;
 static WNDPROC g_prevMessageWndProc = nullptr;
 
-// Frame rate throttling globals (ADD THESE AT GLOBAL SCOPE)
+// Frame rate throttling globals - GPU MODE
 static LARGE_INTEGER g_performanceFrequency = { 0 };
 static LARGE_INTEGER g_lastFrameTime = { 0 };
-static const int TARGET_FPS = 30;  // Lower rendering FPS but drag stays responsive
-static const double FRAME_TIME_MS = 1000.0 / TARGET_FPS; 
+
+// GPU MODE: Higher FPS targets
+static const int TARGET_FPS = 24;        // Realistic for iGPU rendering
+static const int TARGET_RESIZE_FPS = 30; // Smooth enough for drag interactions
+
+// Uncomment for very fast GPUs
+// static const int TARGET_FPS = 60;
+// static const int TARGET_RESIZE_FPS = 120;
+
+static const double FRAME_TIME_MS = 1000.0 / TARGET_FPS;
+
+// Separate throttling for drag/resize events
+static LARGE_INTEGER g_lastResizeTime = { 0 };
+static const double RESIZE_FRAME_TIME_MS = 1000.0 / TARGET_RESIZE_FPS;
 
 // FPS tracking globals
 static int g_frameCount = 0;
 static double g_fpsAccumulator = 0.0;
 static double g_currentFPS = 0.0;
 static LARGE_INTEGER g_fpsCheckTime = { 0 };
-static const double FPS_UPDATE_INTERVAL_MS = 1000.0;  // Update FPS display every 1 second
+static const double FPS_UPDATE_INTERVAL_MS = 1000.0;
 
 static void EnsureUnitySendMessageResolved() {
     std::lock_guard<std::mutex> lock(g_unityResolveMutex);
@@ -86,7 +98,6 @@ static std::string ToUTF8(LPCWSTR wstr) {
     return s;
 }
 
-// Frame rate throttling helper (DEFINE AT GLOBAL SCOPE)
 static bool ShouldThrottleFrame() {
     if (g_performanceFrequency.QuadPart == 0) {
         QueryPerformanceFrequency(&g_performanceFrequency);
@@ -111,7 +122,30 @@ static bool ShouldThrottleFrame() {
     return false;
 }
 
-// Function to update FPS counter
+static bool ShouldThrottleResize() {
+    if (g_performanceFrequency.QuadPart == 0) {
+        QueryPerformanceFrequency(&g_performanceFrequency);
+    }
+    
+    LARGE_INTEGER currentTime;
+    QueryPerformanceCounter(&currentTime);
+    
+    if (g_lastResizeTime.QuadPart == 0) {
+        g_lastResizeTime = currentTime;
+        return false;
+    }
+    
+    double elapsedMs = (double)(currentTime.QuadPart - g_lastResizeTime.QuadPart) 
+                       * 1000.0 / g_performanceFrequency.QuadPart;
+    
+    if (elapsedMs < RESIZE_FRAME_TIME_MS) {
+        return true;
+    }
+    
+    g_lastResizeTime = currentTime;
+    return false;
+}
+
 static void UpdateFPSCounter() {
     if (g_performanceFrequency.QuadPart == 0) {
         QueryPerformanceFrequency(&g_performanceFrequency);
@@ -183,16 +217,19 @@ static void PostMarshal(MarshalPayload* payload) {
     PostMessageW(g_messageWnd, static_cast<UINT>(payload->action), 0, reinterpret_cast<LPARAM>(payload));
 }
 
-// FIXED: Don't throttle Resize (drag) - it needs immediate feedback
 static void RunOrPostToControllerThread(MarshalPayload* payload) {
-    // Only throttle non-interactive operations
-    if (payload->action == MarshalAction::ShowAndNavigate) {
+    if (payload->action == MarshalAction::Resize) {
+        if (ShouldThrottleResize()) {
+            FreeMarshalPayload(payload);
+            return;
+        }
+    }
+    else if (payload->action == MarshalAction::ShowAndNavigate) {
         if (ShouldThrottleFrame()) {
             FreeMarshalPayload(payload);
             return;
         }
     }
-    // Resize (drag) is NOT throttled - always process immediately
     
     if (g_controllerThreadId == GetCurrentThreadId()) {
         SendMessageW(g_messageWnd, static_cast<UINT>(payload->action), 0, reinterpret_cast<LPARAM>(payload));
@@ -228,13 +265,28 @@ extern "C" {
 
         auto options = Make<CoreWebView2EnvironmentOptions>();
         if (options) {
-            // CPU-ONLY MODE: Disable GPU acceleration completely
+            // OPTIMIZED FOR INTEL UHD GRAPHICS (iGPU)
             options->put_AdditionalBrowserArguments(
-                L"--disable-gpu "
-                L"--disable-gpu-compositing "
-                L"--disable-gpu-rasterization "
+                // GPU settings tuned for integrated graphics
+                L"--enable-gpu "
+                L"--enable-gpu-compositing "
+                L"--disable-gpu-rasterization "  // Disable for iGPU - use software rasterization
+                L"--enable-gpu-vsync "
+                L"--use-angle=d3d11 "
+                
+                // Memory optimization (128MB VRAM is tight)
+                L"--memory-pressure-off "
+                L"--disable-renderer-backgrounding "
+                L"--disable-extensions "
+                
+                // iGPU-specific optimizations
                 L"--enable-low-end-device-mode "
-                L"--disable-features=CalculateNativeWinOcclusion,Vulkan"
+                L"--disable-smooth-scrolling "
+                L"--disable-preconnect "
+                L"--disable-blink-features=AutomationControlled "
+                
+                // Reduce memory footprint
+                L"--js-flags=--max-old-space-size=128 --max-semi-space-size=1 "
             );
         }
 
@@ -373,7 +425,22 @@ extern "C" {
         if (!webviewWindow || !isInitialized) return;
         
         if (show) {
-            // Inject debug overlay CSS and HTML
+            std::string perfScript = R"(
+                document.documentElement.style.willChange = 'auto';
+                document.body.style.willChange = 'auto';
+                document.body.style.backfaceVisibility = 'visible';
+                
+                // Reduce animations
+                document.querySelectorAll('*').forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.animation || style.transition) {
+                        el.style.animation = 'none';
+                        el.style.transition = 'none';
+                    }
+                });
+            )";
+            ExecuteScript(perfScript.c_str());
+            
             std::string script = R"(
                 if (!document.getElementById('fps-debug-overlay')) {
                     const overlay = document.createElement('div');
@@ -382,57 +449,83 @@ extern "C" {
                         position: fixed;
                         top: 10px;
                         left: 10px;
-                        background: rgba(0, 0, 0, 0.7);
+                        background: rgba(0, 0, 0, 0.9);
                         color: #0f0;
                         font-family: monospace;
-                        font-size: 14px;
-                        padding: 8px 12px;
+                        font-size: 16px;
+                        padding: 12px 16px;
                         border-radius: 4px;
-                        z-index: 9999;
+                        z-index: 99999;
                         font-weight: bold;
-                        border: 1px solid #0f0;
+                        border: 2px solid #0f0;
+                        box-shadow: 0 0 10px rgba(0, 255, 0, 0.5);
                     `;
-                    overlay.textContent = 'FPS: 0';
+                    overlay.textContent = 'FPS: 0 (GPU)';
                     document.body.appendChild(overlay);
                     
-                    // Update FPS every 100ms
-                    window.fpsUpdateInterval = setInterval(() => {
-                        if (window.frameCount === undefined) window.frameCount = 0;
-                        window.frameCount++;
-                        
+                    let frameCount = 0;
+                    let lastTime = performance.now();
+                    
+                    function updateFPS() {
+                        frameCount++;
                         const now = performance.now();
-                        if (window.lastFpsTime === undefined) {
-                            window.lastFpsTime = now;
-                            window.frameCount = 0;
+                        const elapsed = now - lastTime;
+                        
+                        if (elapsed >= 1000) {
+                            const fps = Math.round((frameCount * 1000) / elapsed);
+                            const color = fps < 30 ? '#ff0000' : fps < 50 ? '#ffaa00' : '#00ff00';
+                            overlay.style.borderColor = color;
+                            overlay.style.color = color;
+                            overlay.textContent = `FPS: ${fps} (GPU)`;
+                            frameCount = 0;
+                            lastTime = now;
                         }
                         
-                        const elapsed = now - window.lastFpsTime;
-                        if (elapsed >= 1000) {
-                            const fps = Math.round((window.frameCount * 1000) / elapsed);
-                            document.getElementById('fps-debug-overlay').textContent = `FPS: ${fps}`;
-                            window.lastFpsTime = now;
-                            window.frameCount = 0;
-                        }
-                    }, 100);
+                        requestAnimationFrame(updateFPS);
+                    }
+                    
+                    updateFPS();
                 }
             )";
             ExecuteScript(script.c_str());
         } else {
-            // Remove debug overlay
             std::string script = R"(
-                if (window.fpsUpdateInterval) {
-                    clearInterval(window.fpsUpdateInterval);
-                }
                 const overlay = document.getElementById('fps-debug-overlay');
                 if (overlay) overlay.remove();
             )";
             ExecuteScript(script.c_str());
         }
     }
+
+    // Adaptive quality scaling for iGPU
+    static float g_renderingScale = 1.0f;
+    static bool g_useHardwareAcceleration = true;
+
+    __declspec(dllexport) void SetGPUQualityMode(int mode) {
+        // mode: 0 = High (1.0 scale), 1 = Balanced (0.85 scale), 2 = Power Save (0.75 scale)
+        switch (mode) {
+            case 0:
+                g_renderingScale = 1.0f;
+                break;
+            case 1:
+                g_renderingScale = 0.85f;
+                break;
+            case 2:
+                g_renderingScale = 0.75f;
+                break;
+            default:
+                g_renderingScale = 0.85f;
+        }
+        
+        if (!webviewWindow || !isInitialized) return;
+        
+        std::string script = "document.body.style.zoom = '" + std::to_string(g_renderingScale) + "';";
+        ExecuteScript(script.c_str());
+    }
 }
 
 static LRESULT CALLBACK MessageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    UpdateFPSCounter();  // ADD THIS LINE - update FPS on every message
+    UpdateFPSCounter();
     
     MarshalPayload* payload = reinterpret_cast<MarshalPayload*>(lParam);
     if (payload) {
