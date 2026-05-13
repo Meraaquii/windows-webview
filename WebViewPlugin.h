@@ -51,4 +51,12 @@ extern "C" {
 
     // Show/hide FPS debug overlay in the webview (green text, top-left corner).
     DLLExport void ShowFPSDebugOverlay(bool show);
+
+    // Set the internal render scale (0.25 - 2.0). Lower values reduce GPU load at high-DPI.
+    // This uses native WebView2 rasterization scale (not CSS zoom).
+    DLLExport void SetRenderResolutionScale(float scale);
+
+    // Automatically scale down rendering so the internal width never exceeds maxWidth pixels.
+    // Call this once after InitWebView; it applies on every Resize automatically.
+    DLLExport void SetMaxRenderResolution(int maxWidth);
 }

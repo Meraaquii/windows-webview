@@ -55,6 +55,10 @@ static double g_currentFPS = 0.0;
 static LARGE_INTEGER g_fpsCheckTime = { 0 };
 static const double FPS_UPDATE_INTERVAL_MS = 1000.0;
 
+// Native render resolution cap globals
+static float g_rasterizationScale = 1.0f;
+static int g_maxRenderWidth = 0;  // 0 = unlimited
+
 static void EnsureUnitySendMessageResolved() {
     std::lock_guard<std::mutex> lock(g_unityResolveMutex);
     if (pUnitySendMessage) return;
@@ -144,6 +148,23 @@ static bool ShouldThrottleResize() {
     
     g_lastResizeTime = currentTime;
     return false;
+}
+
+static void ApplyRasterizationScale() {
+    if (!webviewController || g_rasterizationScale <= 0.0f) return;
+    ComPtr<ICoreWebView2Controller3> controller3;
+    HRESULT hr = webviewController.As(&controller3);
+    if (SUCCEEDED(hr) && controller3) {
+        controller3->put_RasterizationScale(g_rasterizationScale);
+    }
+}
+
+static float CalculateScaleForBounds(int width, int height) {
+    if (g_maxRenderWidth <= 0 || width <= 0) return g_rasterizationScale;
+    float scale = static_cast<float>(g_maxRenderWidth) / static_cast<float>(width);
+    if (scale > 1.0f) scale = 1.0f;
+    if (scale < 0.25f) scale = 0.25f;
+    return scale;
 }
 
 static void UpdateFPSCounter() {
@@ -274,19 +295,18 @@ extern "C" {
                 L"--enable-gpu-vsync "
                 L"--use-angle=d3d11 "
                 
-                // Memory optimization (128MB VRAM is tight)
-                L"--memory-pressure-off "
+                // Memory management (allow pressure signals with 32GB RAM)
                 L"--disable-renderer-backgrounding "
                 L"--disable-extensions "
-                
+
                 // iGPU-specific optimizations
                 L"--enable-low-end-device-mode "
                 L"--disable-smooth-scrolling "
                 L"--disable-preconnect "
                 L"--disable-blink-features=AutomationControlled "
-                
-                // Reduce memory footprint
-                L"--js-flags=--max-old-space-size=128 --max-semi-space-size=1 "
+
+                // JS heap tuned for 32GB RAM (was 128MB, too aggressive)
+                L"--js-flags=--max-old-space-size=512 --max-semi-space-size=4 "
             );
         }
 
@@ -522,6 +542,31 @@ extern "C" {
         std::string script = "document.body.style.zoom = '" + std::to_string(g_renderingScale) + "';";
         ExecuteScript(script.c_str());
     }
+
+    __declspec(dllexport) void SetRenderResolutionScale(float scale) {
+        if (scale < 0.25f) scale = 0.25f;
+        if (scale > 2.0f) scale = 2.0f;
+        g_rasterizationScale = scale;
+        g_maxRenderWidth = 0;  // manual scale overrides auto cap
+        ApplyRasterizationScale();
+    }
+
+    __declspec(dllexport) void SetMaxRenderResolution(int maxWidth) {
+        if (maxWidth < 640) maxWidth = 640;
+        g_maxRenderWidth = maxWidth;
+        // If already initialized, re-calculate from current bounds
+        if (webviewController && isInitialized) {
+            RECT bounds = { 0 };
+            if (SUCCEEDED(webviewController->get_Bounds(&bounds))) {
+                int w = bounds.right - bounds.left;
+                int h = bounds.bottom - bounds.top;
+                if (w > 0) {
+                    g_rasterizationScale = CalculateScaleForBounds(w, h);
+                    ApplyRasterizationScale();
+                }
+            }
+        }
+    }
 }
 
 static LRESULT CALLBACK MessageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -545,6 +590,11 @@ static LRESULT CALLBACK MessageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             if (webviewController && isInitialized) {
                 RECT bounds = { payload->x, payload->y, payload->x + payload->w, payload->y + payload->h };
                 webviewController->put_Bounds(bounds);
+                // Auto-downscale if a max render width is set
+                if (g_maxRenderWidth > 0) {
+                    g_rasterizationScale = CalculateScaleForBounds(payload->w, payload->h);
+                    ApplyRasterizationScale();
+                }
             }
             break;
         case MarshalAction::Hide:
